@@ -142,7 +142,14 @@ impl Coordinator {
         }
 
         let mut sequence_slot = self.heartbeat_sequence.lock().await;
-        if request.sequence <= *sequence_slot && *sequence_slot != 0 {
+        // Sequences are strictly positive and strictly increasing. The
+        // `== 0` check is redundant against a fresh standby (whose
+        // `heartbeat_sequence` starts at 0, so `<=` already rejects 0)
+        // but guards against a sequence-0 replay ever being accepted if
+        // the recorded sequence were ever reset. Rejecting `<=` with no
+        // `!= 0` escape hatch closes the original replay hole where an
+        // initial sequence of 0 bypassed the monotonicity check forever.
+        if request.sequence == 0 || request.sequence <= *sequence_slot {
             return HeartbeatResponse {
                 accepted: false,
                 last_applied_sequence: *sequence_slot,
@@ -151,23 +158,22 @@ impl Coordinator {
         *sequence_slot = request.sequence;
         drop(sequence_slot);
 
-        // Replace local state with the primary's snapshot. Each
-        // mutex is taken in turn and released immediately so the
-        // window during which the standby is mid-mirror is short.
+        // Replace local state with the primary's snapshot. All four
+        // state mutexes are acquired simultaneously in the canonical
+        // order (validators -> active_tasks -> parent_tasks -> results)
+        // so concurrent readers never observe a torn, partially-applied
+        // snapshot, and every lock is held for the whole swap. The
+        // canonical order matches every other multi-lock site in this
+        // file, so there is no lock-order inversion (ABBA) deadlock.
         {
             let mut validators = self.validators.lock().await;
-            *validators = request.snapshot.validators;
-        }
-        {
             let mut active_tasks = self.active_tasks.lock().await;
-            *active_tasks = request.snapshot.active_tasks;
-        }
-        {
             let mut parent_tasks = self.parent_tasks.lock().await;
-            *parent_tasks = request.snapshot.parent_tasks;
-        }
-        {
             let mut results = self.results.lock().await;
+
+            *validators = request.snapshot.validators;
+            *active_tasks = request.snapshot.active_tasks;
+            *parent_tasks = request.snapshot.parent_tasks;
             *results = request.snapshot.results;
         }
 
@@ -470,12 +476,15 @@ impl Coordinator {
             task.status = TaskStatus::Completed;
         }
 
-        // Store result
+        // Store result. The two locks are taken in the canonical order
+        // (parent_tasks before results) so this can never deadlock
+        // against snapshot()/apply_heartbeat(), which hold
+        // parent_tasks -> results.
+        let parent_tasks = self.parent_tasks.lock().await;
         let mut results = self.results.lock().await;
         results.insert(result.task_id.clone(), result.clone());
 
         // Check if all chunks completed
-        let parent_tasks = self.parent_tasks.lock().await;
         if let Some(parent_id) = parent_tasks.get(&result.task_id) {
             let parent_id_clone = parent_id.clone();
 
@@ -527,10 +536,12 @@ impl Coordinator {
         info!("║         AGGREGATING RESULTS               ║");
         info!("╚═══════════════════════════════════════════╝");
 
-        // Clone the data and release locks immediately
+        // Clone the data and release locks immediately. Locks are taken
+        // in the canonical order (parent_tasks before results) so this
+        // cannot deadlock against snapshot()/apply_heartbeat().
         let chunk_results: Vec<TaskResult> = {
-            let results = self.results.lock().await;
             let parent_tasks = self.parent_tasks.lock().await;
+            let results = self.results.lock().await;
 
             let mut chunk_results: Vec<_> = results
                 .iter()
@@ -638,22 +649,27 @@ impl Coordinator {
 
     /// Capture a serializable snapshot of all in-memory coordinator state.
     ///
-    /// Acquires each of the four state mutexes in turn, clones the
-    /// inner data, and releases the lock immediately. The snapshot is
-    /// a point-in-time view: by the time the caller reads it, the
-    /// underlying state may have moved on. Replication, heartbeat,
-    /// and promotion logic on top of this surface is tracked under
-    /// #66; this method is the data foothold those PRs build on.
+    /// All four state mutexes are acquired simultaneously in the
+    /// canonical order (validators -> active_tasks -> parent_tasks ->
+    /// results) and held until every map has been cloned. This yields a
+    /// genuinely atomic point-in-time view: a concurrent task
+    /// completion or reassignment can no longer interleave between the
+    /// `active_tasks` clone and the `results`/`parent_tasks` clone and
+    /// produce a torn snapshot whose parts disagree with one another.
+    /// The canonical order matches every other multi-lock site in this
+    /// file, so the simultaneous acquisition introduces no lock-order
+    /// inversion (ABBA) deadlock risk. Replication, heartbeat, and
+    /// promotion logic on top of this surface is tracked under #66.
     pub async fn snapshot(&self) -> CoordinatorSnapshot {
-        let validators = self.validators.lock().await.clone();
-        let active_tasks = self.active_tasks.lock().await.clone();
-        let parent_tasks = self.parent_tasks.lock().await.clone();
-        let results = self.results.lock().await.clone();
+        let validators = self.validators.lock().await;
+        let active_tasks = self.active_tasks.lock().await;
+        let parent_tasks = self.parent_tasks.lock().await;
+        let results = self.results.lock().await;
         CoordinatorSnapshot {
-            validators,
-            active_tasks,
-            parent_tasks,
-            results,
+            validators: (*validators).clone(),
+            active_tasks: (*active_tasks).clone(),
+            parent_tasks: (*parent_tasks).clone(),
+            results: (*results).clone(),
         }
     }
 }
@@ -780,6 +796,162 @@ mod tests {
         let resp2 = standby.apply_heartbeat(&NodeId(vec![0x01]), req1).await;
         assert!(!resp2.accepted);
         assert_eq!(resp2.last_applied_sequence, 1);
+    }
+
+    /// #992: the previous guard `request.sequence <= *sequence_slot &&
+    /// *sequence_slot != 0` accepted *every* sequence-0 heartbeat while a
+    /// standby had not yet applied anything (`heartbeat_sequence == 0`),
+    /// so a stale sequence-0 snapshot could be replayed indefinitely.
+    /// Sequences must now be strictly positive *and* strictly increasing.
+    #[tokio::test]
+    async fn heartbeat_rejects_zero_and_decreasing_sequences() {
+        let standby = Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        );
+
+        let mut stale_snapshot = CoordinatorSnapshot::default();
+        stale_snapshot.validators.push(NodeId(vec![0xAA]));
+        let zero_request = HeartbeatRequest {
+            primary: NodeId(vec![0x01]),
+            sequence: 0,
+            snapshot: stale_snapshot.clone(),
+        };
+
+        // A sequence-0 heartbeat is rejected against a fresh standby, and
+        // its snapshot is never mirrored.
+        let resp = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), zero_request.clone())
+            .await;
+        assert!(!resp.accepted, "sequence 0 must be rejected");
+        assert_eq!(resp.last_applied_sequence, 0);
+        assert!(
+            standby.snapshot().await.validators.is_empty(),
+            "a rejected sequence-0 heartbeat must not mutate standby state"
+        );
+
+        // Replaying sequence 0 must keep being rejected; state stays empty.
+        let replayed = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), zero_request.clone())
+            .await;
+        assert!(!replayed.accepted, "replayed sequence 0 must stay rejected");
+        assert!(standby.snapshot().await.validators.is_empty());
+
+        // The first strictly-positive sequence (1) is accepted.
+        let first_valid = HeartbeatRequest {
+            primary: NodeId(vec![0x01]),
+            sequence: 1,
+            snapshot: stale_snapshot.clone(),
+        };
+        let accepted = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), first_valid.clone())
+            .await;
+        assert!(accepted.accepted, "sequence 1 must be accepted");
+        assert_eq!(accepted.last_applied_sequence, 1);
+        assert!(standby
+            .snapshot()
+            .await
+            .validators
+            .contains(&NodeId(vec![0xAA])));
+
+        // A non-increasing (replayed) sequence after a valid one is rejected.
+        let replay = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), first_valid)
+            .await;
+        assert!(!replay.accepted, "replaying sequence 1 must be rejected");
+        assert_eq!(replay.last_applied_sequence, 1);
+
+        // Even a fresh sequence-0 heartbeat is still rejected once the
+        // recorded sequence has advanced, so the view never moves backwards.
+        let zero_after = standby
+            .apply_heartbeat(&NodeId(vec![0x01]), zero_request)
+            .await;
+        assert!(!zero_after.accepted, "sequence 0 must never be accepted");
+        assert_eq!(zero_after.last_applied_sequence, 1);
+    }
+    /// #992: `snapshot()` and `apply_heartbeat()` used to touch the four
+    /// state mutexes one at a time, so a snapshot taken while a heartbeat
+    /// was mid-mirror could splice `active_tasks` from before the swap
+    /// with `results` from after it. Both now hold all four mutexes for
+    /// the whole operation, so every snapshot observes one of the two
+    /// fully-consistent states and never a torn mixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_never_observes_torn_state_during_concurrent_apply() {
+        let standby = Arc::new(Coordinator::standby_of(
+            make_test_network(),
+            NodeId(vec![0x01]),
+            Duration::from_secs(30),
+        ));
+
+        // Two internally-consistent variants: either every map is empty or
+        // every map is populated. A torn snapshot shows a mixture.
+        let snapshot_variant = |with_data: bool| -> CoordinatorSnapshot {
+            if !with_data {
+                return CoordinatorSnapshot::default();
+            }
+            let mut snapshot = CoordinatorSnapshot::default();
+            snapshot.validators.push(NodeId(vec![0xAA]));
+            let mut task = Task::new(TaskType::HashCalculation {
+                start: 0,
+                end: 0,
+                algorithm: "sha256".to_string(),
+            });
+            task.id = "t".to_string();
+            snapshot.active_tasks.insert("t".to_string(), task);
+            snapshot
+                .parent_tasks
+                .insert("t".to_string(), "p".to_string());
+            snapshot.results.insert(
+                "t".to_string(),
+                TaskResult {
+                    task_id: "t".to_string(),
+                    execution_time_ms: 1,
+                    data: ResultData::Hashes {
+                        hashes: vec![],
+                        count: 0,
+                    },
+                },
+            );
+            snapshot
+        };
+
+        let writer = Arc::clone(&standby);
+        let reader = Arc::clone(&standby);
+        let iterations = 2_000u64;
+
+        let write_task = tokio::spawn(async move {
+            for seq in 1..=iterations {
+                let request = HeartbeatRequest {
+                    primary: NodeId(vec![0x01]),
+                    sequence: seq,
+                    snapshot: snapshot_variant(seq % 2 == 0),
+                };
+                let resp = writer.apply_heartbeat(&NodeId(vec![0x01]), request).await;
+                assert!(resp.accepted, "monotonic heartbeat must be accepted");
+            }
+        });
+
+        let read_task = tokio::spawn(async move {
+            for _ in 0..20_000u32 {
+                let snapshot = reader.snapshot().await;
+                let emptiness = [
+                    snapshot.validators.is_empty(),
+                    snapshot.active_tasks.is_empty(),
+                    snapshot.parent_tasks.is_empty(),
+                    snapshot.results.is_empty(),
+                ];
+                let all_empty = emptiness.iter().all(|empty| *empty);
+                let all_populated = emptiness.iter().all(|empty| !*empty);
+                assert!(
+                    all_empty || all_populated,
+                    "torn snapshot observed: maps disagreed on emptiness {emptiness:?}"
+                );
+            }
+        });
+
+        write_task.await.expect("writer task panicked");
+        read_task.await.expect("reader task panicked");
     }
 
     #[tokio::test]
