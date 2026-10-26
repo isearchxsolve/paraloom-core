@@ -9,7 +9,7 @@
 use crate::compute::{ComputeJob, JobId, JobResult};
 use anyhow::{anyhow, Result};
 use log::{debug, info};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -133,18 +133,29 @@ impl ComputeStorage {
     // ========== Active Jobs Operations ==========
 
     /// Mark a job as active (currently executing)
+    ///
+    /// The insert into `CF_ACTIVE_JOBS` and the removal from `CF_PENDING_JOBS`
+    /// are committed together as a single atomic `WriteBatch`, so a crash can
+    /// never leave the job present in both column families (duplicate
+    /// dispatch) or in neither (lost job). See issue #988.
     pub fn mark_job_active(&self, job: &ComputeJob) -> Result<()> {
-        let cf = self
+        let active_cf = self
             .db
             .cf_handle(CF_ACTIVE_JOBS)
             .ok_or_else(|| anyhow!("Active jobs CF not found"))?;
+        let pending_cf = self
+            .db
+            .cf_handle(CF_PENDING_JOBS)
+            .ok_or_else(|| anyhow!("Pending jobs CF not found"))?;
 
         let key = job.id.as_bytes();
         let value = bincode::serialize(job)?;
-        self.db.put_cf(cf, key, value)?;
 
-        // Remove from pending
-        self.remove_pending_job(&job.id)?;
+        // Atomic state transition: active <- job, pending - job.
+        let mut batch = WriteBatch::default();
+        batch.put_cf(active_cf, key, value);
+        batch.delete_cf(pending_cf, key);
+        self.db.write(batch)?;
 
         debug!("Marked job as active: {}", job.id);
         Ok(())
@@ -214,18 +225,29 @@ impl ComputeStorage {
     // ========== Completed Results Operations ==========
 
     /// Store a completed job result
+    ///
+    /// The insert into `CF_COMPLETED_RESULTS` and the removal from
+    /// `CF_ACTIVE_JOBS` are committed together as a single atomic
+    /// `WriteBatch`, so a crash can never leave a completed result while the
+    /// job is still counted as active (metrics/cleanup desync). See issue #988.
     pub fn store_result(&self, result: &JobResult) -> Result<()> {
-        let cf = self
+        let completed_cf = self
             .db
             .cf_handle(CF_COMPLETED_RESULTS)
             .ok_or_else(|| anyhow!("Completed results CF not found"))?;
+        let active_cf = self
+            .db
+            .cf_handle(CF_ACTIVE_JOBS)
+            .ok_or_else(|| anyhow!("Active jobs CF not found"))?;
 
         let key = result.job_id.as_bytes();
         let value = bincode::serialize(result)?;
-        self.db.put_cf(cf, key, value)?;
 
-        // Remove from active jobs
-        self.remove_active_job(&result.job_id)?;
+        // Atomic state transition: completed <- result, active - job.
+        let mut batch = WriteBatch::default();
+        batch.put_cf(completed_cf, key, value);
+        batch.delete_cf(active_cf, key);
+        self.db.write(batch)?;
 
         debug!("Stored result for job: {}", result.job_id);
         Ok(())
@@ -295,17 +317,35 @@ impl ComputeStorage {
     // ========== Utility Operations ==========
 
     /// Clear all pending jobs (for testing/cleanup)
+    ///
+    /// All keys are collected first (releasing the iterator) and then deleted
+    /// in a single atomic `WriteBatch`, avoiding partial clears and iterator
+    /// inconsistency from interleaving writes with a live iterator. See issue
+    /// #988.
     pub fn clear_pending_jobs(&self) -> Result<()> {
         let cf = self
             .db
             .cf_handle(CF_PENDING_JOBS)
             .ok_or_else(|| anyhow!("Pending jobs CF not found"))?;
 
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, _) = item?;
-            self.db.delete_cf(cf, key)?;
+        // Collect every key before mutating so the read iterator is fully
+        // released and the subsequent delete commits atomically.
+        let keys: Vec<Box<[u8]>> = self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .map(|item| item.map(|(key, _)| key))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if keys.is_empty() {
+            debug!("No pending jobs to clear");
+            return Ok(());
         }
+
+        let mut batch = WriteBatch::default();
+        for key in keys {
+            batch.delete_cf(cf, key);
+        }
+        self.db.write(batch)?;
 
         info!("Cleared all pending jobs");
         Ok(())
@@ -416,5 +456,124 @@ mod tests {
         let retrieved = storage.get_result(&job_id).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().job_id, job_id);
+    }
+
+    /// Regression test for #988: `clear_pending_jobs` must delete every pending
+    /// key in a single atomic batch and leave a fully consistent state.
+    #[test]
+    fn test_clear_pending_jobs_batch() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..100u8 {
+            let job = ComputeJob::new(vec![i], vec![i], ResourceLimits::default());
+            ids.push(job.id.clone());
+            storage.add_pending_job(&job).unwrap();
+        }
+        assert_eq!(storage.count_pending_jobs().unwrap(), 100);
+
+        storage.clear_pending_jobs().unwrap();
+
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+        for id in &ids {
+            assert!(storage.get_pending_job(id).unwrap().is_none());
+        }
+
+        // Empty-batch path: clearing again is a no-op that must still succeed.
+        storage.clear_pending_jobs().unwrap();
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+    }
+
+    /// Empty-input boundary: an empty pending CF clears cleanly, no corruption.
+    #[test]
+    fn test_clear_pending_jobs_empty() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+        storage.clear_pending_jobs().unwrap();
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+    }
+
+    /// Regression test for #988: `mark_job_active` moves a job atomically so it
+    /// is never present in both the pending and active column families.
+    #[test]
+    fn test_mark_job_active_atomic_transition() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        let job = ComputeJob::new(vec![1, 2, 3], vec![4], ResourceLimits::default());
+        let job_id = job.id.clone();
+        storage.add_pending_job(&job).unwrap();
+
+        storage.mark_job_active(&job).unwrap();
+
+        // Exactly one of the two column families may hold the job.
+        let in_pending = storage.get_pending_job(&job_id).unwrap().is_some();
+        let in_active = storage.get_active_job(&job_id).unwrap().is_some();
+        assert!(!in_pending, "job must no longer be pending");
+        assert!(in_active, "job must be active");
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+        assert_eq!(storage.count_active_jobs().unwrap(), 1);
+    }
+
+    /// Regression test for #988: `store_result` records the result and retires
+    /// the active job atomically, leaving no lingering active entry.
+    #[test]
+    fn test_store_result_atomic_transition() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        let job = ComputeJob::new(vec![9], vec![8], ResourceLimits::default());
+        let job_id = job.id.clone();
+        storage.add_pending_job(&job).unwrap();
+        storage.mark_job_active(&job).unwrap();
+
+        let result = crate::compute::JobResult::success(job_id.clone(), vec![7], 10, 20, 30);
+        storage.store_result(&result).unwrap();
+
+        assert_eq!(storage.count_active_jobs().unwrap(), 0);
+        assert_eq!(storage.count_completed_results().unwrap(), 1);
+        assert!(storage.get_active_job(&job_id).unwrap().is_none());
+        assert_eq!(storage.get_result(&job_id).unwrap().unwrap().job_id, job_id);
+    }
+
+    /// Negative/absence case: unknown job IDs resolve to `None` without error.
+    #[test]
+    fn test_missing_job_lookups_return_none() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        let missing = "00000000-0000-0000-0000-000000000000".to_string();
+        assert!(storage.get_pending_job(&missing).unwrap().is_none());
+        assert!(storage.get_active_job(&missing).unwrap().is_none());
+        assert!(storage.get_result(&missing).unwrap().is_none());
+    }
+
+    /// Concurrency: simultaneous activations of the same job must converge on a
+    /// single consistent state (job in exactly one CF), never duplicated.
+    #[test]
+    fn test_concurrent_mark_job_active_is_atomic() {
+        let dir = tempdir().unwrap();
+        let storage = ComputeStorage::open(dir.path().join("compute")).unwrap();
+
+        let job = ComputeJob::new(vec![1], vec![2], ResourceLimits::default());
+        let job_id = job.id.clone();
+        storage.add_pending_job(&job).unwrap();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let storage = &storage;
+                let job = &job;
+                scope.spawn(move || {
+                    storage.mark_job_active(job).unwrap();
+                });
+            }
+        });
+
+        assert_eq!(storage.count_pending_jobs().unwrap(), 0);
+        assert_eq!(storage.count_active_jobs().unwrap(), 1);
+        assert!(storage.get_active_job(&job_id).unwrap().is_some());
     }
 }
